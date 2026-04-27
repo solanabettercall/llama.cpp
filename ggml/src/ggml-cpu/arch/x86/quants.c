@@ -715,52 +715,99 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
 #if defined(__AVX2__)
     // Unpack 8 bytes of Q2 (values 0-3) into 32 interleaved uint8 matching Q8_0 layout.
-    // Then use maddubs trick: dot(q2-1, q8) = maddubs(q2, q8) - maddubs(1, q8)
+    // maddubs trick: dot(q2-1, q8) = maddubs(q2, q8) - maddubs(1, q8)
     const __m256i m3     = _mm256_set1_epi8(0x03);
     const __m256i ones8  = _mm256_set1_epi8(1);
     const __m256i ones16 = _mm256_set1_epi16(1);
     __m256 acc = _mm256_setzero_ps();
 
-    for (int ib = 0; ib < nb; ++ib) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+    // Expand one 8-byte Q2 sub-block (from low half of raw128) to 32-byte expanded form,
+    // dot with q8, return int32×8.
+#define Q2_DOT_BLOCK(raw128, q8_vec) \
+    ({ \
+        const __m256i _q2b = _mm256_broadcastsi128_si256(raw128); \
+        const __m256i _p01 = _mm256_unpacklo_epi8(_mm256_and_si256(_q2b, m3), \
+                                                    _mm256_and_si256(_mm256_srli_epi16(_q2b, 2), m3)); \
+        const __m256i _p23 = _mm256_unpacklo_epi8(_mm256_and_si256(_mm256_srli_epi16(_q2b, 4), m3), \
+                                                    _mm256_and_si256(_mm256_srli_epi16(_q2b, 6), m3)); \
+        const __m256i _q2e = _mm256_permute2x128_si256(_mm256_unpacklo_epi16(_p01, _p23), \
+                                                         _mm256_unpackhi_epi16(_p01, _p23), 0x20); \
+        _mm256_madd_epi16( \
+            _mm256_sub_epi16(_mm256_maddubs_epi16(_q2e, (q8_vec)), \
+                             _mm256_maddubs_epi16(ones8, (q8_vec))), ones16); \
+    })
+
+    // Prefetch distance: each block = 34 + 4×34 = 170 bytes;
+    // Zen3 L3 latency ~200 cycles; at ~25 cycles/block, dist=8 hides L3 misses
+    const int PFDIST = 8;
+
+    // 2-way outer unroll: two independent accumulator chains for better ILP
+    int ib = 0;
+    for (; ib + 1 < nb; ib += 2) {
+        _mm_prefetch((const char *)&x[ib + PFDIST],         _MM_HINT_T0);
+        _mm_prefetch((const char *)&y[(ib + PFDIST) * 4],   _MM_HINT_T0);
+        _mm_prefetch((const char *)&y[(ib + PFDIST) * 4 + 2], _MM_HINT_T0);
+
+        // Load all 32 Q2 bytes for both blocks in one shot each
+        const __m256i q2_a = _mm256_loadu_si256((const __m256i *)x[ib].qs);
+        const __m256i q2_b = _mm256_loadu_si256((const __m256i *)x[ib + 1].qs);
+
+        const block_q8_0 * GGML_RESTRICT ya = &y[ib * 4];
+        const block_q8_0 * GGML_RESTRICT yb = &y[(ib + 1) * 4];
+
+        // Extract each 8-byte Q2 sub-block from the 32-byte load
+        const __m128i qa_lo = _mm256_castsi256_si128(q2_a);                         // K=0,1
+        const __m128i qa_hi = _mm256_extracti128_si256(q2_a, 1);                    // K=2,3
+        const __m128i qb_lo = _mm256_castsi256_si128(q2_b);
+        const __m128i qb_hi = _mm256_extracti128_si256(q2_b, 1);
+
+        // Block a
+        const __m256 da = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d));
+        __m256 acc_a;
+        acc_a  = _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(ya[0].d)),
+                               _mm256_cvtepi32_ps(Q2_DOT_BLOCK(qa_lo, _mm256_loadu_si256((const __m256i *)ya[0].qs))));
+        acc_a  = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(ya[1].d)),
+                                 _mm256_cvtepi32_ps(Q2_DOT_BLOCK(_mm_srli_si128(qa_lo, 8), _mm256_loadu_si256((const __m256i *)ya[1].qs))), acc_a);
+        acc_a  = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(ya[2].d)),
+                                 _mm256_cvtepi32_ps(Q2_DOT_BLOCK(qa_hi, _mm256_loadu_si256((const __m256i *)ya[2].qs))), acc_a);
+        acc_a  = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(ya[3].d)),
+                                 _mm256_cvtepi32_ps(Q2_DOT_BLOCK(_mm_srli_si128(qa_hi, 8), _mm256_loadu_si256((const __m256i *)ya[3].qs))), acc_a);
+
+        // Block b
+        const __m256 db = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib + 1].d));
+        __m256 acc_b;
+        acc_b  = _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb[0].d)),
+                               _mm256_cvtepi32_ps(Q2_DOT_BLOCK(qb_lo, _mm256_loadu_si256((const __m256i *)yb[0].qs))));
+        acc_b  = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb[1].d)),
+                                 _mm256_cvtepi32_ps(Q2_DOT_BLOCK(_mm_srli_si128(qb_lo, 8), _mm256_loadu_si256((const __m256i *)yb[1].qs))), acc_b);
+        acc_b  = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb[2].d)),
+                                 _mm256_cvtepi32_ps(Q2_DOT_BLOCK(qb_hi, _mm256_loadu_si256((const __m256i *)yb[2].qs))), acc_b);
+        acc_b  = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb[3].d)),
+                                 _mm256_cvtepi32_ps(Q2_DOT_BLOCK(_mm_srli_si128(qb_hi, 8), _mm256_loadu_si256((const __m256i *)yb[3].qs))), acc_b);
+
+        acc = _mm256_fmadd_ps(da, acc_a, acc);
+        acc = _mm256_fmadd_ps(db, acc_b, acc);
+    }
+    // Tail: handle remaining block (if nb is odd)
+    for (; ib < nb; ++ib) {
+        const __m256i q2_all = _mm256_loadu_si256((const __m256i *)x[ib].qs);
+        const __m128i q2_lo  = _mm256_castsi256_si128(q2_all);
+        const __m128i q2_hi  = _mm256_extracti128_si256(q2_all, 1);
         const block_q8_0 * GGML_RESTRICT y_ptr = &y[ib * 4];
 
         __m256 acc_block;
-
-        {
-            const __m128i raw = _mm_loadl_epi64((const __m128i *)&x[ib].qs[0]);
-            const __m256i q2b = _mm256_broadcastsi128_si256(raw);
-            const __m256i p01 = _mm256_unpacklo_epi8(_mm256_and_si256(q2b, m3),
-                                                      _mm256_and_si256(_mm256_srli_epi16(q2b, 2), m3));
-            const __m256i p23 = _mm256_unpacklo_epi8(_mm256_and_si256(_mm256_srli_epi16(q2b, 4), m3),
-                                                      _mm256_and_si256(_mm256_srli_epi16(q2b, 6), m3));
-            const __m256i q2e = _mm256_permute2x128_si256(_mm256_unpacklo_epi16(p01, p23),
-                                                           _mm256_unpackhi_epi16(p01, p23), 0x20);
-            const __m256i q8 = _mm256_loadu_si256((const __m256i *)y_ptr[0].qs);
-            const __m256i d32 = _mm256_madd_epi16(
-                _mm256_sub_epi16(_mm256_maddubs_epi16(q2e, q8), _mm256_maddubs_epi16(ones8, q8)),
-                ones16);
-            acc_block = _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[0].d)),
-                                      _mm256_cvtepi32_ps(d32));
-        }
-        for (int K = 1; K < 4; ++K) {
-            const __m128i raw = _mm_loadl_epi64((const __m128i *)&x[ib].qs[K * 8]);
-            const __m256i q2b = _mm256_broadcastsi128_si256(raw);
-            const __m256i p01 = _mm256_unpacklo_epi8(_mm256_and_si256(q2b, m3),
-                                                      _mm256_and_si256(_mm256_srli_epi16(q2b, 2), m3));
-            const __m256i p23 = _mm256_unpacklo_epi8(_mm256_and_si256(_mm256_srli_epi16(q2b, 4), m3),
-                                                      _mm256_and_si256(_mm256_srli_epi16(q2b, 6), m3));
-            const __m256i q2e = _mm256_permute2x128_si256(_mm256_unpacklo_epi16(p01, p23),
-                                                           _mm256_unpackhi_epi16(p01, p23), 0x20);
-            const __m256i q8 = _mm256_loadu_si256((const __m256i *)y_ptr[K].qs);
-            const __m256i d32 = _mm256_madd_epi16(
-                _mm256_sub_epi16(_mm256_maddubs_epi16(q2e, q8), _mm256_maddubs_epi16(ones8, q8)),
-                ones16);
-            acc_block = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[K].d)),
-                                        _mm256_cvtepi32_ps(d32), acc_block);
-        }
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+        acc_block  = _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[0].d)),
+                                   _mm256_cvtepi32_ps(Q2_DOT_BLOCK(q2_lo, _mm256_loadu_si256((const __m256i *)y_ptr[0].qs))));
+        acc_block  = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[1].d)),
+                                     _mm256_cvtepi32_ps(Q2_DOT_BLOCK(_mm_srli_si128(q2_lo, 8), _mm256_loadu_si256((const __m256i *)y_ptr[1].qs))), acc_block);
+        acc_block  = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[2].d)),
+                                     _mm256_cvtepi32_ps(Q2_DOT_BLOCK(q2_hi, _mm256_loadu_si256((const __m256i *)y_ptr[2].qs))), acc_block);
+        acc_block  = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[3].d)),
+                                     _mm256_cvtepi32_ps(Q2_DOT_BLOCK(_mm_srli_si128(q2_hi, 8), _mm256_loadu_si256((const __m256i *)y_ptr[3].qs))), acc_block);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d)), acc_block, acc);
     }
+#undef Q2_DOT_BLOCK
+
     sumf = hsum_float_8(acc);
 #elif defined(__SSSE3__)
     const __m128i m3     = _mm_set1_epi8(0x03);
